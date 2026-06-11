@@ -14,7 +14,7 @@ const ALLOWED = new Set(['nslookup', 'ping', 'tracert']);
 function buildCmd(cmd, host) {
     const prefix = 'chcp 65001 >nul 2>&1 & ';
     switch (cmd) {
-        case 'nslookup': return `${prefix}nslookup ${host}`;
+        case 'nslookup': return `${prefix}nslookup ${host} 170.233.68.249`;
         case 'ping':     return `${prefix}ping -n 4 ${host}`;
         case 'tracert':  return `${prefix}tracert -d -h 20 -w 900 ${host}`;
     }
@@ -108,6 +108,70 @@ const server = http.createServer((req, res) => {
             clearTimeout(maxTimer);
             emit('error', err.message);
             try { res.end(); } catch (_) {}
+        });
+
+        req.on('close', () => {
+            clearTimeout(maxTimer);
+            try { proc.kill(); } catch (_) {}
+        });
+
+        return;
+    }
+
+    // ── Compatibility endpoint (non-SSE fallback) ─────────────
+    if (pathname === '/api/run') {
+        const host = (query.host || '').trim();
+        const cmd  = (query.cmd  || '').trim();
+
+        if (!host || !HOST_RE.test(host)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Host inválido' }));
+            return;
+        }
+        if (!ALLOWED.has(cmd)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Comando no permitido' }));
+            return;
+        }
+
+        const cmdLine = buildCmd(cmd, host);
+        const proc = spawn('cmd.exe', ['/c', cmdLine], { windowsHide: true });
+        const maxMs = getMaxMs(cmd);
+        let stdout = '';
+        let stderr = '';
+        let closed = false;
+        let timedOut = false;
+
+        const maxTimer = setTimeout(() => {
+            if (closed) return;
+            timedOut = true;
+            try { proc.kill(); } catch (_) {}
+        }, maxMs);
+
+        proc.stdout.on('data', chunk => { stdout += chunk.toString('utf8'); });
+        proc.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
+
+        proc.on('close', code => {
+            if (closed) return;
+            closed = true;
+            clearTimeout(maxTimer);
+            if (timedOut) {
+                stderr += `\n[Timeout] ${cmd} superó el tiempo límite y fue detenido.`;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                output: `${stdout}${stderr ? (stdout ? '\n' : '') + stderr : ''}`,
+                exitCode: code,
+                timedOut,
+            }));
+        });
+
+        proc.on('error', err => {
+            if (closed) return;
+            closed = true;
+            clearTimeout(maxTimer);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
         });
 
         req.on('close', () => {
